@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # dso-name-pseudonymizer
 Replaces names in text with pseudonyms generated from a configurable list or algorithmically.  Allows preserving name format (e.g., first name last name) and gender. - Focused on Tools for sanitizing and obfuscating sensitive data within text files and structured data formats
 
