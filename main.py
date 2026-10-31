@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import logging
-import os
 import random
 import re
 import sys
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import List, Optional
 
 try:
     from faker import Faker
@@ -37,9 +37,7 @@ class NamePseudonymizer:
         self.gender = gender
         self.locale = locale
         self.fake = Faker(self.locale)
-        # Per run mapping: each distinct original name keeps one pseudonym for the
-        # whole run, and a pseudonym is never shared by two different originals.
-        self._pseudonym_map = {}
+        self._mapping = {}
         self._used_pseudonyms = set()
         self.replacement_count = 0
 
@@ -69,62 +67,67 @@ class NamePseudonymizer:
                 return self.fake.name()
 
     def _pseudonym_for(self, original: str) -> str:
-        """
-        Returns the pseudonym assigned to an original name in this run.
+        if original in self._mapping:
+            return self._mapping[original]
+        for _ in range(1000):
+            if self.names and self._used_pseudonyms.issuperset(set(self.names)):
+                # The list has no unused name left, so generate instead of
+                # sharing a pseudonym between two different originals.
+                if self.gender == 'male':
+                    candidate = self.fake.name_male()
+                elif self.gender == 'female':
+                    candidate = self.fake.name_female()
+                else:
+                    candidate = self.fake.name()
+            else:
+                candidate = self._generate_pseudonym()
+            if candidate not in self._used_pseudonyms and candidate != original:
+                self._mapping[original] = candidate
+                self._used_pseudonyms.add(candidate)
+                return candidate
+        raise RuntimeError("Could not generate a collision free pseudonym")
 
-        The first occurrence draws a fresh pseudonym that no other original in
-        this run uses; later occurrences reuse the same pseudonym.
-        """
-        if original in self._pseudonym_map:
-            return self._pseudonym_map[original]
-        candidate = self._generate_pseudonym()
-        attempts = 0
-        while candidate in self._used_pseudonyms:
-            attempts += 1
-            if attempts > 1000:
-                raise RuntimeError(f"Could not generate a unique pseudonym for: {original}")
-            candidate = self._generate_pseudonym()
-        self._pseudonym_map[original] = candidate
-        self._used_pseudonyms.add(candidate)
-        return candidate
-
-    def pseudonymize_text(self, text: str) -> Tuple[str, int]:
+    def pseudonymize_text(self, text: str) -> str:
         """
         Replaces names in the input text with pseudonyms.
-
-        Two word names are matched as whole tokens in title case, all capitals,
-        Mc and Mac forms, apostrophe forms (O'Brien), and hyphenated forms
-        (replaced whole, never partly). A single name is replaced only in a
-        marked context: after "name is", "named", "called", or an honorific
-        (Mr., Mrs., Ms., Dr., Miss).
 
         Args:
             text (str): The input text to pseudonymize.
 
         Returns:
-            Tuple[str, int]: The pseudonymized text and the number of replacements made.
+            str: The pseudonymized text.
         """
-        token = r"(?:Mac[A-Z][a-z]+|Mc[A-Z][a-z]+|[A-Z][a-z]*'[A-Z][a-z]+|[A-Z][a-z]+|[A-Z]+)"
-        name_part = rf"{token}(?:-{token})?"
-        pair_pattern = rf"\b{name_part}\s+{name_part}\b"
-        single_pattern = (
-            rf"(?P<prefix>\b(?:[Nn]ame is|[Nn]amed|[Cc]alled|Mr\.|Mrs\.|Ms\.|Dr\.|Miss)\s+)"
-            rf"(?P<name>{name_part})(?!\s+{token}\b)"
+
+        # One token covers title case, hyphenated and apostrophe parts,
+        # Mc and Mac forms, O'Brien style forms, and all capitals forms.
+        token = (
+            r"(?:Mc[A-Z][a-z]+|Mac[A-Z][a-z]+|O'(?:[A-Z][a-z]+|[A-Z]+)"
+            r"|[A-Z]{2,}(?:[-'][A-Z]+)*|[A-Z][a-z]+(?:[-'][A-Za-z]+)*)"
+        )
+        pair = token + r"\s+" + token
+        # A pair is replaced as a whole. A single name is replaced only in
+        # a marked context: after "name is", "named", or "called", or after
+        # an honorific. The negative lookahead keeps a pair that follows a
+        # marker or an honorific on the pair path instead of the single path.
+        name_pattern = (
+            r"(?P<pair>\b" + pair + r"\b)"
+            r"|(?P<ctx_prefix>(?i:\bname\s+is|\bnamed|\bcalled)\s+)"
+            r"(?P<ctx_single>" + token + r")(?!\s+" + token + r"\b)(?![\w'-])"
+            r"|(?P<hon_prefix>\b(?:Mr|Mrs|Ms|Dr|Miss)\.\s+)"
+            r"(?P<hon_single>" + token + r")(?!\s+" + token + r"\b)(?![\w'-])"
         )
 
-        def replace_pair(match):
+        def replace_name(match):
             self.replacement_count += 1
-            return self._pseudonym_for(match.group(0))
+            if match.group("pair") is not None:
+                return self._pseudonym_for(match.group("pair"))
+            if match.group("ctx_single") is not None:
+                return match.group("ctx_prefix") + self._pseudonym_for(match.group("ctx_single"))
+            return match.group("hon_prefix") + self._pseudonym_for(match.group("hon_single"))
 
-        def replace_single(match):
-            self.replacement_count += 1
-            return match.group('prefix') + self._pseudonym_for(match.group('name'))
-
-        # Pairs first. The single pattern's negative lookahead then keeps it
-        # from touching the first word of a pseudonym the pair pass just wrote.
-        pseudonymized_text = re.sub(pair_pattern, replace_pair, text)
-        pseudonymized_text = re.sub(single_pattern, replace_single, pseudonymized_text)
-        return pseudonymized_text, self.replacement_count
+        self.replacement_count = 0
+        pseudonymized_text = re.sub(name_pattern, replace_name, text)
+        return pseudonymized_text
 
 
 def setup_argparse() -> argparse.ArgumentParser:
@@ -155,6 +158,9 @@ def main():
     logging.getLogger().setLevel(args.log_level)
 
     try:
+        if Path(args.input_file).resolve() == Path(args.output_file).resolve():
+            print("Error: Output file is the same as the input file; refusing to overwrite it in place.")
+            sys.exit(1)
         # Input validation
         if args.name_list and args.gender:
              logging.warning("Both --name_list and --gender are specified.  Using --name_list and ignoring --gender.") # not fatal
@@ -165,12 +171,6 @@ def main():
             sys.exit(1) # critical.
         except Exception as e:
             print(f"Error initializing pseudonymizer: {e}")
-            sys.exit(1)
-
-        # Refuse to overwrite the input file, under any spelling of its path.
-        if os.path.realpath(args.input_file) == os.path.realpath(args.output_file):
-            logging.error("Output file resolves to the input file; refusing to overwrite the input.")
-            print("Error: Output file resolves to the input file; refusing to overwrite the input.")
             sys.exit(1)
 
         # Determine file encoding
@@ -193,11 +193,10 @@ def main():
             sys.exit(1)
 
         # Pseudonymize the text
-        pseudonymized_text, replacement_count = pseudonymizer.pseudonymize_text(text)
+        pseudonymized_text = pseudonymizer.pseudonymize_text(text)
 
-        if replacement_count == 0:
-            logging.warning(f"Nothing was pseudonymized in {args.input_file}: no names found.")
-            print(f"Nothing was pseudonymized in {args.input_file}: no names found.")
+        if pseudonymizer.replacement_count == 0:
+            print("Nothing was pseudonymized: no names were found in the input.")
             sys.exit(1)
 
         # Write the output to a file
@@ -209,8 +208,8 @@ def main():
             print(f"Error writing to output file: {e}")
             sys.exit(1)
 
-        logging.info(f"Pseudonymized text written to {args.output_file} ({replacement_count} replacements)")
-        print(f"Pseudonymized text written to {args.output_file} ({replacement_count} replacements)")
+        logging.info(f"Pseudonymized text written to {args.output_file} ({pseudonymizer.replacement_count} replacements)")
+        print(f"Pseudonymized text written to {args.output_file} ({pseudonymizer.replacement_count} replacements)")
 
     except Exception as e:
         logging.critical(f"An unexpected error occurred: {e}")
