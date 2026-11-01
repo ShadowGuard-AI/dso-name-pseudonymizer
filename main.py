@@ -44,6 +44,11 @@ class NamePseudonymizer:
         if name_list_path:
             try:
                 with open(name_list_path, 'r', encoding='utf-8') as f:
+                    # Blank lines in the list survive the strip as empty
+                    # strings and stay in the pool, so random.choice can
+                    # hand an original an empty pseudonym, which deletes
+                    # the name from the text while still counting as a
+                    # replacement.
                     self.names = [line.strip() for line in f]
             except FileNotFoundError:
                 logging.error(f"Name list file not found: {name_list_path}")
@@ -67,6 +72,12 @@ class NamePseudonymizer:
                 return self.fake.name()
 
     def _pseudonym_for(self, original: str) -> str:
+        # The map is keyed by the exact surface string, so consistency
+        # holds per written form only: the pair John Smith and a later
+        # marked single John are different keys and receive different
+        # pseudonyms, and the same person reads as two people in the
+        # output. Nothing links the forms, because the pattern layer above
+        # never tells this layer that they are one person.
         if original in self._mapping:
             return self._mapping[original]
         for _ in range(1000):
@@ -117,6 +128,15 @@ class NamePseudonymizer:
             r"(?P<hon_single>" + token + r")(?!\s+" + token + r"\b)(?![\w'-])"
         )
 
+        # What the pair branch really matches is any two capitalized
+        # tokens side by side, and it cannot tell a person from a place or
+        # a phrase: Wall Street and Monday Morning are pseudonymized as
+        # people. The three token case cuts the other way and is worse:
+        # John Ronald Tolkien matches as the pair John Ronald, which is
+        # replaced, and the third token is left standing in the clear,
+        # because a single token is replaced only in a marked context and
+        # nothing marks it there. The output can therefore carry a real
+        # surname beside a fake full name.
         def replace_name(match):
             self.replacement_count += 1
             if match.group("pair") is not None:
